@@ -83,6 +83,29 @@ fn test_create_match_with_empty_game_id_rejected() {
 }
 
 #[test]
+fn test_create_match_tournament_with_frozen_player_rejected() {
+    let (env, contract_id, _oracle, player1, player2, token, admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    client.freeze_player(&admin, &player1);
+
+    let result = client.try_create_match_tournament(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "a1b2c3d4"),
+        &Platform::Lichess,
+    );
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::ContractPaused)),
+        "frozen player must not be able to create a tournament match"
+    );
+}
+
+#[test]
 fn test_deposit_insufficient_balance_rejected() {
     let (env, contract_id, _oracle, _player1, player2, token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);

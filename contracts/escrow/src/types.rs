@@ -144,6 +144,16 @@ pub struct Match {
     pub last_heartbeat: u64,
     /// Optional tournament bracket ID for tournament matches.
     pub bracket_id: Option<u64>,
+    /// Ledger timestamp (Unix seconds) at which both players had deposited and
+    /// the match transitioned to `Active`. Used by `admin_resolve_stalled_match`
+    /// (#1518 fix) to measure the stall window from activation rather than from
+    /// the player-controlled `last_heartbeat`.
+    pub activated_at: Option<u64>,
+    /// Records which player has voted to roll back the match via
+    /// `dispute_and_rollback_match`. Both players must vote before the refund
+    /// executes (#1517 fix: mutual-consent rollback).
+    pub rollback_vote_player1: bool,
+    pub rollback_vote_player2: bool,
 }
 
 #[contracttype]

@@ -1345,7 +1345,9 @@ fn test_pause_resume_cycle_preserves_escrow_balance() {
 }
 
 #[test]
-fn test_submit_result_fails_on_paused_match() {
+fn test_submit_result_succeeds_on_paused_match() {
+    // #1516 fix: the oracle result is authoritative — the oracle can settle
+    // a Paused match so a losing player cannot block payout by pausing.
     let (env, contract_id, oracle, player1, player2, token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
 
@@ -1362,9 +1364,10 @@ fn test_submit_result_fails_on_paused_match() {
     client.deposit(&id, &player2);
     client.pause_match(&id, &player1);
 
-    // Cannot submit result on paused match
-    let result = client.try_submit_result(&id, &Winner::Player1, &oracle);
-    assert!(result.is_err());
+    // Oracle CAN submit result even on a paused match (#1516).
+    client.submit_result(&id, &Winner::Player1, &oracle);
+    assert_eq!(client.get_match(&id).state, MatchState::Completed);
+    assert_eq!(client.get_match(&id).winner, Winner::Player1);
 }
 
 #[test]

@@ -406,7 +406,7 @@ This section lists the complete public function surface of `EscrowContract` (`co
 | `admin_unfreeze_player` | `(player: Address)` | Admin-only. Reverses `admin_freeze_player`, restoring the player's ability to create matches and deposit. |
 | `is_player_frozen` | `(player: Address) -> bool` | Returns whether `player` is currently frozen. |
 | `get_frozen_players` | `() -> Vec<Address>` | Returns all currently frozen player addresses. |
-
+| `admin_list_frozen_players` | `(caller: Address) -> Vec<Address>` | Admin-only. Returns all currently frozen player addresses with the caller authorization check. Equivalent to `get_frozen_players` but enforces admin-only access. |
 #### Token Allowlist
 
 | Function | Signature | Description |
@@ -416,7 +416,7 @@ This section lists the complete public function surface of `EscrowContract` (`co
 | `is_token_allowed` | `(token: Address) -> bool` | Returns whether `token` is accepted (always `true` if enforcement is not yet enabled). |
 | `is_allowlist_enforced` | `() -> bool` | Returns whether allowlist enforcement has been turned on. |
 | `get_allowed_tokens` | `() -> Vec<Address>` | Returns all currently allowlisted tokens. |
-
+| `get_allowed_tokens_paginated` | `(offset: u32, limit: u32) -> Vec<Address>` | Returns a paginated slice of the allowlisted token addresses. Use `offset` and `limit` to iterate over large allowlists without unbounded reads. |
 #### Match Management
 
 | Function | Signature | Description |
@@ -431,7 +431,8 @@ This section lists the complete public function surface of `EscrowContract` (`co
 | `resume_match` | `(match_id: u64, caller: Address)` | Either player may resume a `Paused` match, restoring its prior state and accumulating `total_pause_duration`. |
 | `heartbeat_match` | `(match_id: u64, player: Address) -> Result<(), Error>` | Either player refreshes `Match.last_heartbeat` to the current ledger timestamp on an `Active` match. Pure timestamp update — no token movement — used to keep `dispute_and_rollback_match`'s 24-hour window alive during long games. |
 | `dispute_and_rollback_match` | `(match_id: u64, disputer: Address, reason: String) -> Result<(), Error>` | Either player may roll back an `Active` match to `Cancelled` with a full refund (no cancellation fee) if called within `ROLLBACK_WINDOW_SECONDS` (24h) of `Match.last_heartbeat`. A player-friendly escape hatch for a stalled/disconnected opponent, distinct from the oracle-result dispute flow. |
-
+| `update_heartbeat` | `(match_id: u64, caller: Address) -> Result<(), Error>` | Public alias for `heartbeat_match`. Either player may call to refresh `Match.last_heartbeat` on an `Active` match; use this entry point for external callers. |
+| `bulk_expire_matches` | `(match_ids: Vec<u64>) -> Vec<u64>` | Batch version of `expire_match`. Attempts to expire each match in `match_ids`; returns the subset of IDs that were successfully expired. Matches that fail the timeout check or are not in `Pending` state are silently skipped. |
 #### Escrow
 
 | Function | Signature | Description |
@@ -441,7 +442,7 @@ This section lists the complete public function surface of `EscrowContract` (`co
 | `is_funded` | `(match_id: u64) -> bool` | Returns `true` when both players have deposited. |
 | `get_depositor_count` | `(match_id: u64) -> u32` | Returns how many of the two players (0, 1, or 2) have deposited. |
 | `claim_vested_payout` | `(match_id: u64, player: Address)` | For matches settled under a non-zero `vesting_duration_seconds`: releases `player`'s share once the vesting period (tracked via `vested_at`) has elapsed. Returns `Error::Overflow` on timestamp arithmetic overflow. |
-
+| `deposit_batch` | `(entries: Vec<(u64, Address)>) -> Result<Vec<Option<Error>>, Error>` | Batch version of `deposit`. Accepts a list of `(match_id, player)` pairs and processes each independently. Returns `Error::ContractPaused` immediately if the contract is paused; otherwise returns a `Vec` of outcomes (`None` = success, `Some(Error)` = that entry's failure) in input order. |
 #### Oracle, Payouts & Disputes
 
 | Function | Signature | Description |
@@ -458,7 +459,7 @@ This section lists the complete public function surface of `EscrowContract` (`co
 | `get_dispute_period` | `(&Env) -> u32` | Returns the currently configured dispute period. |
 | `get_dispute` | `(dispute_id: u64) -> Dispute` | Returns the stored dispute record. |
 | `get_match_dispute_id` | `(match_id: u64) -> u64` | Returns the dispute ID associated with a match, if one has been raised. |
-| `mark_dispute_for_oracle_slash` | `(dispute_id: u64, slash_amount: i128) -> Result<(), Error>` | Admin-only. For a `ResolvedOverturned` dispute, emits an `oracle_slash_signal` event containing the oracle address and slash amount. An off-chain relay service automatically listens for this event and invokes the oracle contract's `slash_oracle` to execute the penalty. See [Oracle Slash Relay](oracle.md#oracle-slash-relay) for details. |
+| `get_dispute_details` | `(match_id: u64) -> Result<Dispute, Error>` | Returns the full `Dispute` record for the dispute associated with `match_id`. Convenience wrapper over `get_dispute` that looks up the dispute ID from `match_id` in one call. Returns `Error::DisputeNotFound` if no dispute exists for the match. || `mark_dispute_for_oracle_slash` | `(dispute_id: u64, slash_amount: i128) -> Result<(), Error>` | Admin-only. For a `ResolvedOverturned` dispute, emits an `oracle_slash_signal` event containing the oracle address and slash amount. An off-chain relay service automatically listens for this event and invokes the oracle contract's `slash_oracle` to execute the penalty. See [Oracle Slash Relay](oracle.md#oracle-slash-relay) for details. |
 | `set_dispute_bond_basis_points` | `(basis_points: u32) -> Result<(), Error>` | Admin-only. Sets the dispute bond requirement as basis points of match stake (1–10,000). |
 | `get_dispute_bond_basis_points` | `() -> u32` | Returns the current dispute bond basis points (default `DEFAULT_DISPUTE_BOND_BASIS_POINTS`). |
 | `set_minimum_hold_duration` | `(duration: u32) -> Result<(), Error>` | Admin-only. Sets the minimum token-holding duration (in ledgers) required for a vote on `vote_on_dispute` to count. |
@@ -566,6 +567,15 @@ This section lists the complete public function surface of `EscrowContract` (`co
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `get_platform_stats` | `() -> PlatformStats` | Returns cumulative on-chain counters — `total_matches`, `total_volume` (staked, in base token units), and `total_payouts` — maintained without requiring off-chain event indexing. |
+
+#### ELO Rating Registry
+
+These functions expose the oracle-verified player rating registry introduced in issue #1434. Both are part of the contract ABI (inside the `#[contractimpl]` block) and are callable on-chain and through the generated `EscrowContractClient`.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `register_player_rating` | `(caller: Address, player: Address, platform: Platform, username: String, rating: u32) -> Result<(), Error>` | Oracle-only. Records or updates the verified ELO rating for `player` on `platform` (Lichess or Chess.com). `caller` must be the configured oracle address. Emits `("rating", "registered")` with payload `(player, platform, rating)`. Returns `Error::Unauthorized` if `caller` is not the oracle or the contract is uninitialized. |
+| `get_player_rating` | `(player: Address, platform: Platform) -> Option<PlayerRating>` | View function, no authentication required. Returns the stored `PlayerRating` (username, rating, recorded_ledger) for the given `(player, platform)` pair, or `None` if no rating has been registered yet. |
 
 #### Upgrade & Migration
 

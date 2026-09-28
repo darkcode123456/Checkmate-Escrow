@@ -4,9 +4,6 @@ import { useAdminContract, decodeAddress, decodeBoolean, isContractPausedError }
 import * as freighter from '../wallets/freighter';
 import * as albedo from '../wallets/albedo';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-declare const global: any;
-
 // Mock wallet signing functions
 vi.mock('../wallets/freighter', () => ({
   freighterSign: vi.fn(),
@@ -60,10 +57,11 @@ function mockFetchImpl(_url: string | Request, opts?: RequestInit): Promise<Resp
   } as Response);
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 beforeEach(() => {
   vi.clearAllMocks();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (global as any).fetch = vi.fn(mockFetchImpl);
+  (globalThis as any).fetch = vi.fn(mockFetchImpl);
 });
 
 afterEach(() => {
@@ -152,7 +150,7 @@ describe('useAdminContract', () => {
     });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (global as any).fetch = vi.fn().mockImplementation((_url: string | Request, opts?: RequestInit): Promise<Response> => {
+    (globalThis as any).fetch = vi.fn().mockImplementation((_url: string | Request, opts?: RequestInit): Promise<Response> => {
       const body = opts?.body ? JSON.parse(opts.body as string) : {};
 
       if (body.method === 'getAccount') {

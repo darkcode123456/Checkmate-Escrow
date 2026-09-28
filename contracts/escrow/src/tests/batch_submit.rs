@@ -206,3 +206,71 @@ fn test_submit_result_batch_empty() {
 
     assert_eq!(outcomes.len(), 0);
 }
+
+// #1529 — submit_result_batch must authorize against the effective oracle so
+// that a temporary oracle rotation is honoured, matching submit_result and
+// submit_draw. During an active temporary rotation the temporary oracle can
+// batch-submit while the rotated-out oracle cannot.
+#[test]
+fn test_submit_result_batch_honours_temporary_oracle_rotation() {
+    let (env, contract_id, _oracle, player1, player2, token, admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let match_a = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "rot_batch_a"),
+        &Platform::Lichess,
+    );
+    let match_b = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "rot_batch_b"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&match_a, &player1);
+    client.deposit(&match_a, &player2);
+    client.deposit(&match_b, &player1);
+    client.deposit(&match_b, &player2);
+
+    let original_oracle = client.get_oracle();
+    let temporary_oracle = Address::generate(&env);
+
+    // Activate a temporary oracle rotation.
+    client.rotate_oracle_temporary(&admin, &temporary_oracle);
+
+    // The temporary oracle is now the effective oracle and must be able to
+    // batch-submit results.
+    let batch = soroban_sdk::vec![&env, (match_a, Winner::Player1), (match_b, Winner::Player2)];
+    let outcomes = client.submit_result_batch(&batch, &temporary_oracle);
+
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes.get(0).unwrap(), None);
+    assert_eq!(outcomes.get(1).unwrap(), None);
+
+    assert_eq!(client.get_match(&match_a).state, MatchState::Completed);
+    assert_eq!(client.get_match(&match_a).winner, Winner::Player1);
+    assert_eq!(client.get_match(&match_b).state, MatchState::Completed);
+    assert_eq!(client.get_match(&match_b).winner, Winner::Player2);
+
+    // The rotated-out oracle must no longer be able to batch-submit.
+    let match_c = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "rot_batch_c"),
+        &Platform::Lichess,
+    );
+    client.deposit(&match_c, &player1);
+    client.deposit(&match_c, &player2);
+
+    let stale_batch = soroban_sdk::vec![&env, (match_c, Winner::Player1)];
+    let stale_result = client.try_submit_result_batch(&stale_batch, &original_oracle);
+    assert!(stale_result.is_err());
+}

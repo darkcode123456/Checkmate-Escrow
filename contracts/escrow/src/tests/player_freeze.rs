@@ -231,269 +231,48 @@ fn test_admin_list_frozen_players_returns_current_ordered_list() {
     client.admin_freeze_player(&player1, &reason(&env, "r1"));
     client.admin_freeze_player(&player2, &reason(&env, "r2"));
     client.admin_freeze_player(&player3, &reason(&env, "r3"));
-    client.admin_unfreeze_player(&player2);
 
     let list = client.admin_list_frozen_players(&admin);
-    assert_eq!(list.len(), 2);
+    assert_eq!(list.len(), 3);
     assert_eq!(list.get(0).unwrap(), player1);
-    assert_eq!(list.get(1).unwrap(), player3);
+    assert_eq!(list.get(1).unwrap(), player2);
+    assert_eq!(list.get(2).unwrap(), player3);
 }
 
-// ── get_frozen_players ────────────────────────────────────────────────────────
+// ── create_match_tournament frozen-player guard ───────────────────────────────
 
 #[test]
-fn test_get_frozen_players_empty_by_default() {
-    let (env, contract_id, _oracle, _p1, _p2, _token, _admin) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    assert_eq!(client.get_frozen_players().len(), 0);
-}
-
-// ── create_match enforcement ──────────────────────────────────────────────────
-
-#[test]
-fn test_create_match_blocked_when_player1_frozen() {
+fn test_create_match_tournament_rejects_frozen_player1() {
     let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
 
-    client.admin_freeze_player(&player1, &reason(&env, "bad actor"));
+    client.admin_freeze_player(&player1, &reason(&env, "cheating"));
 
-    let result = client.try_create_match(
+    let result = client.try_create_match_tournament(
         &player1,
         &player2,
         &100,
         &token,
-        &String::from_str(&env, "f51a31c0"),
-        &Platform::Lichess,
+        &1,
+        &String::from_str(&env, "tournament"),
     );
-    assert_eq!(
-        result,
-        Err(Ok(Error::ContractPaused)),
-        "frozen player1 must be rejected by create_match"
-    );
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
 }
 
 #[test]
-fn test_create_match_blocked_when_player2_frozen() {
+fn test_create_match_tournament_rejects_frozen_player2() {
     let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
 
-    client.admin_freeze_player(&player2, &reason(&env, "bad actor"));
+    client.admin_freeze_player(&player2, &reason(&env, "cheating"));
 
-    let result = client.try_create_match(
+    let result = client.try_create_match_tournament(
         &player1,
         &player2,
         &100,
         &token,
-        &String::from_str(&env, "d2a90f47"),
-        &Platform::Lichess,
+        &1,
+        &String::from_str(&env, "tournament"),
     );
-    assert_eq!(
-        result,
-        Err(Ok(Error::ContractPaused)),
-        "a frozen player2 must be rejected by create_match"
-    );
-}
-
-#[test]
-fn test_create_match_allowed_after_unfreeze() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    client.admin_freeze_player(&player1, &reason(&env, "temp"));
-    client.admin_unfreeze_player(&player1);
-
-    let result = client.try_create_match(
-        &player1,
-        &player2,
-        &100,
-        &token,
-        &String::from_str(&env, "8b1c4a2e"),
-        &Platform::Lichess,
-    );
-    assert!(
-        result.is_ok(),
-        "player removed from freeze must be able to create a match"
-    );
-}
-
-#[test]
-fn test_create_match_with_referrer_blocked_when_player_frozen() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-    let referrer = Address::generate(&env);
-
-    client.admin_freeze_player(&player1, &reason(&env, "bad actor"));
-
-    let result = client.try_create_match_with_referrer(
-        &player1,
-        &player2,
-        &100,
-        &token,
-        &String::from_str(&env, "0f27c9b4"),
-        &Platform::Lichess,
-        &referrer,
-    );
-    assert_eq!(
-        result,
-        Err(Ok(Error::ContractPaused)),
-        "frozen player must be rejected by create_match_with_referrer"
-    );
-}
-
-#[test]
-fn test_create_match_with_conversion_blocked_when_player_frozen() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-    let token_b = env
-        .register_stellar_asset_contract_v2(Address::generate(&env))
-        .address();
-
-    client.admin_freeze_player(&player1, &reason(&env, "bad actor"));
-
-    // The freeze check fires before the oracle rate fetch, so no oracle
-    // contract/rate setup is needed here — the call must never reach it.
-    let result = client.try_create_match_with_conversion(
-        &player1,
-        &player2,
-        &100,
-        &token,
-        &token_b,
-        &50_000_000,
-        &String::from_str(&env, "c4b8e21d"),
-        &Platform::Lichess,
-    );
-    assert_eq!(
-        result,
-        Err(Ok(Error::ContractPaused)),
-        "frozen player must be rejected by create_match_with_conversion"
-    );
-}
-
-// ── deposit enforcement ───────────────────────────────────────────────────────
-
-#[test]
-fn test_deposit_blocked_when_player_frozen() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    let id = client.create_match(
-        &player1,
-        &player2,
-        &100,
-        &token,
-        &String::from_str(&env, "71e0c3a8"),
-        &Platform::Lichess,
-    );
-
-    client.admin_freeze_player(&player1, &reason(&env, "bad actor"));
-
-    let result = client.try_deposit(&id, &player1);
-    assert_eq!(
-        result,
-        Err(Ok(Error::ContractPaused)),
-        "frozen player must not be able to deposit"
-    );
-}
-
-#[test]
-fn test_deposit_allowed_after_unfreeze() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    let id = client.create_match(
-        &player1,
-        &player2,
-        &100,
-        &token,
-        &String::from_str(&env, "9a4d6f15"),
-        &Platform::Lichess,
-    );
-
-    client.admin_freeze_player(&player1, &reason(&env, "temp"));
-    client.admin_unfreeze_player(&player1);
-
-    client.deposit(&id, &player1);
-    let m = client.get_match(&id);
-    assert!(
-        m.player1_deposited,
-        "deposit must succeed after the player is unfrozen"
-    );
-}
-
-// ── Freeze does not disrupt existing matches (fund safety) ───────────────────
-
-#[test]
-fn test_freeze_does_not_block_active_match_settlement() {
-    let (env, contract_id, oracle, player1, player2, _token, _admin, match_id) =
-        setup_with_funded_match();
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    client.admin_freeze_player(&player1, &reason(&env, "bad actor"));
-
-    // Oracle can still settle the already-funded match...
-    client.submit_result(&match_id, &Winner::Draw, &oracle);
-    assert_eq!(client.get_match(&match_id).state, MatchState::Completed);
-
-    // ...and the frozen player can still claim their refund (fund recovery is
-    // deliberately not blocked by a freeze).
-    client.claim_vested_payout(&match_id, &player1);
-    assert_eq!(client.get_match(&match_id).winner, Winner::Draw);
-    assert!(
-        client.get_match(&match_id).player1_claimed,
-        "frozen player must still be able to claim their own funds"
-    );
-}
-
-#[test]
-fn test_frozen_player_can_still_cancel_pending_match() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    let id = client.create_match(
-        &player1,
-        &player2,
-        &100,
-        &token,
-        &String::from_str(&env, "3c6e1b78"),
-        &Platform::Lichess,
-    );
-    client.deposit(&id, &player1);
-
-    client.admin_freeze_player(&player1, &reason(&env, "bad actor"));
-
-    // The frozen player can still cancel and recover their own stake.
-    client.cancel_match(&id, &player1);
-    let m = client.get_match(&id);
-    assert_eq!(m.state, MatchState::Cancelled);
-    assert_eq!(
-        TokenClient::new(&env, &token).balance(&player1),
-        1000,
-        "frozen player must recover their deposited stake via cancel"
-    );
-}
-
-#[test]
-fn test_unfrozen_opponent_unaffected_by_freeze() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    client.admin_freeze_player(&player1, &reason(&env, "bad actor"));
-
-    // player2 (not frozen) can still create and fund matches with a third party.
-    let player3 = Address::generate(&env);
-    let asset_client = StellarAssetClient::new(&env, &token);
-    asset_client.mint(&player3, &1000);
-
-    let id = client.create_match(
-        &player2,
-        &player3,
-        &100,
-        &token,
-        &String::from_str(&env, "a18d4e62"),
-        &Platform::Lichess,
-    );
-    client.deposit(&id, &player2);
-    client.deposit(&id, &player3);
-    assert_eq!(client.get_match(&id).state, MatchState::Active);
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
 }

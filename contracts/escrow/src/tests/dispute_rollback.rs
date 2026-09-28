@@ -114,13 +114,22 @@ fn test_rollback_within_window_refunds_both_players() {
     // Advance 23h59m — well within the 24h window.
     advance_timestamp(&env, ROLLBACK_WINDOW_SECONDS - 60);
 
+    // #1517: Both players must consent — first vote only records the flag.
     client.dispute_and_rollback_match(&id, &player1, &String::from_str(&env, "c16e8e9a"));
+    assert_eq!(
+        client.get_match(&id).state,
+        MatchState::Active,
+        "match must remain Active after only one player votes"
+    );
+
+    // Second vote executes the refund.
+    client.dispute_and_rollback_match(&id, &player2, &String::from_str(&env, "c16e8e9a"));
 
     let m = client.get_match(&id);
     assert_eq!(
         m.state,
         MatchState::Cancelled,
-        "match must transition to Cancelled after a successful rollback"
+        "match must transition to Cancelled after mutual rollback consent"
     );
     assert_eq!(
         token_client.balance(&player1),
@@ -151,7 +160,9 @@ fn test_rollback_at_exact_window_boundary_succeeds() {
     // Advance exactly the window length — must still be allowed.
     advance_timestamp(&env, ROLLBACK_WINDOW_SECONDS);
 
+    // Both players consent (#1517: mutual consent required).
     client.dispute_and_rollback_match(&id, &player2, &String::from_str(&env, "6717ca6c"));
+    client.dispute_and_rollback_match(&id, &player1, &String::from_str(&env, "6717ca6c"));
 
     let m = client.get_match(&id);
     assert_eq!(
@@ -167,11 +178,13 @@ fn test_rollback_at_exact_window_boundary_succeeds() {
 fn test_rollback_by_either_player_succeeds() {
     // Symmetric test: both player1 → rollback, and player2 → rollback on
     // separate fresh matches, must both succeed within the window.
+    // #1517: mutual consent — both players must call for the refund to execute.
     let (env, contract_id, _oracle, p1a, p2a, token_a, _admin) = setup();
     let client_a = EscrowContractClient::new(&env, &contract_id);
     env.ledger().set_timestamp(100);
     let match_a = create_active_match(&client_a, &env, &p1a, &p2a, &token_a, "29c1ed2d");
     client_a.dispute_and_rollback_match(&match_a, &p1a, &String::from_str(&env, "16f58d84"));
+    client_a.dispute_and_rollback_match(&match_a, &p2a, &String::from_str(&env, "16f58d84"));
     assert_eq!(client_a.get_match(&match_a).state, MatchState::Cancelled);
 
     let (env, contract_id, _oracle, p1b, p2b, token_b, _admin) = setup();
@@ -179,6 +192,7 @@ fn test_rollback_by_either_player_succeeds() {
     env.ledger().set_timestamp(100);
     let match_b = create_active_match(&client_b, &env, &p1b, &p2b, &token_b, "3509dee8");
     client_b.dispute_and_rollback_match(&match_b, &p2b, &String::from_str(&env, "69ce7626"));
+    client_b.dispute_and_rollback_match(&match_b, &p1b, &String::from_str(&env, "69ce7626"));
     assert_eq!(client_b.get_match(&match_b).state, MatchState::Cancelled);
 }
 
@@ -327,11 +341,14 @@ fn test_rollback_rejects_already_cancelled_match() {
 
     env.ledger().set_timestamp(100);
     let id = create_active_match(&client, &env, &player1, &player2, &token, "a87258c4");
+    // Both players consent — match transitions to Cancelled.
     client.dispute_and_rollback_match(&id, &player1, &String::from_str(&env, "79c6dd18"));
+    client.dispute_and_rollback_match(&id, &player2, &String::from_str(&env, "79c6dd18"));
     assert_eq!(client.get_match(&id).state, MatchState::Cancelled);
 
+    // A third call (any player) on the now-Cancelled match must be rejected.
     let result =
-        client.try_dispute_and_rollback_match(&id, &player2, &String::from_str(&env, "082e1045"));
+        client.try_dispute_and_rollback_match(&id, &player1, &String::from_str(&env, "082e1045"));
     assert_eq!(
         result,
         Err(Ok(Error::InvalidState)),
@@ -390,7 +407,9 @@ fn test_rollback_emits_match_rollback_event() {
     let id = create_active_match(&client, &env, &player1, &player2, &token, "5363cb7f");
 
     let reason = String::from_str(&env, "64d7cfda");
+    // Both players must consent; the rollback event is emitted by the second call.
     client.dispute_and_rollback_match(&id, &player1, &reason);
+    client.dispute_and_rollback_match(&id, &player2, &reason);
 
     let events = env.events().all();
     // "match" is emitted as a long Symbol (top-level scope) and "rollback"
@@ -406,14 +425,15 @@ fn test_rollback_emits_match_rollback_event() {
         .find(|(_, topics, _)| *topics == expected_topics);
     assert!(
         matched.is_some(),
-        "match/rollback event must be emitted on successful rollback"
+        "match/rollback event must be emitted on successful (mutual) rollback"
     );
 
     let (_, _, data) = matched.unwrap();
     let (ev_id, ev_disputer, ev_reason): (u64, Address, String) =
         TryFromVal::try_from_val(&env, &data).unwrap();
     assert_eq!(ev_id, id);
-    assert_eq!(ev_disputer, player1);
+    // The disputer in the event is the second consenting player.
+    assert_eq!(ev_disputer, player2);
     assert_eq!(ev_reason, reason);
 }
 
@@ -559,9 +579,15 @@ fn test_rollback_multi_token_match_refunds_each_player_in_their_token() {
     // on-chain `swap`, but for a deterministic unit test we mint directly.
     StellarAssetClient::new(&env, &token_b).mint(&escrow_client.address, &500);
 
+    // #1517: Both players must consent for the refund to execute.
     escrow_client.dispute_and_rollback_match(
         &match_id,
         &player1,
+        &String::from_str(&env, "5dfd0223"),
+    );
+    escrow_client.dispute_and_rollback_match(
+        &match_id,
+        &player2,
         &String::from_str(&env, "5dfd0223"),
     );
 
@@ -628,7 +654,9 @@ fn test_rollback_multi_token_emits_match_rollback_event() {
     let reason = String::from_str(&env, "a09e238d");
     env.ledger().set_timestamp(0);
 
+    // #1517: Both players must consent.
     escrow_client.dispute_and_rollback_match(&match_id, &player1, &reason);
+    escrow_client.dispute_and_rollback_match(&match_id, &player2, &reason);
 
     let events = env.events().all();
     let expected_topics = vec![
@@ -795,7 +823,9 @@ fn test_heartbeat_match_rejects_non_active_states() {
 
     // Cancelled state — heartbeat rejected.
     let cancel_id = create_active_match(&client, &env, &player1, &player2, &token, "4088fa58");
+    // Both players consent to rollback to put match in Cancelled state.
     client.dispute_and_rollback_match(&cancel_id, &player1, &String::from_str(&env, "297c3c59"));
+    client.dispute_and_rollback_match(&cancel_id, &player2, &String::from_str(&env, "297c3c59"));
     let r = client.try_heartbeat_match(&cancel_id, &player1);
     assert_eq!(
         r,
@@ -861,13 +891,15 @@ fn test_heartbeat_match_keeps_rollback_window_alive_past_24h() {
     // would have been stale — but the heartbeat refreshed it.
     adv_to(&env, 90);
 
+    // #1517: Both players must consent for the refund to execute.
     client.dispute_and_rollback_match(&id, &player2, &String::from_str(&env, "7a20679e"));
+    client.dispute_and_rollback_match(&id, &player1, &String::from_str(&env, "7a20679e"));
 
     let m = client.get_match(&id);
     assert_eq!(
         m.state,
         MatchState::Cancelled,
-        "heartbeat must keep the rollback window alive so subsequent dispute succeeds"
+        "heartbeat must keep the rollback window alive so subsequent mutual dispute succeeds"
     );
 }
 

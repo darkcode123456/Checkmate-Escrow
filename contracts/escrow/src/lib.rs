@@ -90,6 +90,13 @@ pub const VOTING_PERIOD_LEDGERS: u32 = 17_280;
 /// back a stake after claiming the opponent disconnected. 24 hours.
 pub const ROLLBACK_WINDOW_SECONDS: u64 = 24 * 60 * 60; // 86_400
 
+/// Maximum duration (in ledgers) that a match may stay in `Paused` state
+/// before the oracle is permitted to settle it as if it were `Active`, and
+/// before the admin recovery path accepts it. At ~5 s/ledger this is 24 hours.
+/// Addresses #1516: caps pause duration so the loser cannot block settlement
+/// indefinitely by re-pausing after each resume.
+pub const MAX_PAUSE_DURATION_LEDGERS: u32 = 17_280; // 24 h at 5 s/ledger
+
 /// Time window (in seconds, since `last_heartbeat`) after which an admin
 /// may invoke `admin_resolve_stalled_match` to recover funds from an Active
 /// match that has received no oracle result. Set to 7 days (longer than the
@@ -1272,6 +1279,9 @@ impl EscrowContract {
             referrer: None,
             last_heartbeat: env.ledger().timestamp(),
             bracket_id: None,
+            activated_at: None,
+            rollback_vote_player1: false,
+            rollback_vote_player2: false,
         };
 
         env.storage().persistent().set(&DataKey::Match(id), &m);
@@ -1445,6 +1455,9 @@ impl EscrowContract {
             referrer: None,
             last_heartbeat: env.ledger().timestamp(),
             bracket_id: Some(bracket_id),
+            activated_at: None,
+            rollback_vote_player1: false,
+            rollback_vote_player2: false,
         };
 
         env.storage().persistent().set(&DataKey::Match(id), &m);
@@ -1682,6 +1695,9 @@ impl EscrowContract {
             referrer: None,
             last_heartbeat: env.ledger().timestamp(),
             bracket_id: None,
+            activated_at: None,
+            rollback_vote_player1: false,
+            rollback_vote_player2: false,
         };
 
         env.storage().persistent().set(&DataKey::Match(id), &m);
@@ -1857,6 +1873,9 @@ impl EscrowContract {
             referrer: Some(referrer.clone()),
             last_heartbeat: env.ledger().timestamp(),
             bracket_id: None,
+            activated_at: None,
+            rollback_vote_player1: false,
+            rollback_vote_player2: false,
         };
 
         env.storage().persistent().set(&DataKey::Match(id), &m);
@@ -2024,6 +2043,8 @@ impl EscrowContract {
 
         if m.player1_deposited && m.player2_deposited {
             m.state = MatchState::Active;
+            // Record activation timestamp for the stall-window baseline (#1518).
+            m.activated_at = Some(env.ledger().timestamp());
             env.events().publish(
                 (Symbol::new(&env, "match"), symbol_short!("deposit")),
                 (match_id, player.clone(), Some(m.state.clone())),
@@ -2159,7 +2180,9 @@ impl EscrowContract {
             return Err(Error::NotFunded);
         }
 
-        if m.state != MatchState::Active {
+        // #1516 fix: the oracle result is authoritative — allow settlement of
+        // Paused matches so a losing player cannot block payout by pausing.
+        if m.state != MatchState::Active && m.state != MatchState::Paused {
             return Err(Error::InvalidState);
         }
 
@@ -2173,8 +2196,10 @@ impl EscrowContract {
         Self::record_completed_match(env, &m.player1);
         Self::record_completed_match(env, &m.player2);
         Self::record_platform_payout(env);
-        Self::update_player_stats(env, &m.player1, &winner, m.stake_amount);
-        Self::update_player_stats(env, &m.player2, &winner, m.stake_amount);
+        // #1519 fix: pass is_player1 flag so win/loss is recorded from the
+        // correct player's perspective, not always from Player1's perspective.
+        Self::update_player_stats(env, &m.player1, &winner, m.stake_amount, true);
+        Self::update_player_stats(env, &m.player2, &winner, m.stake_amount, false);
 
         env.storage()
             .persistent()
@@ -2549,6 +2574,10 @@ impl EscrowContract {
 
     /// Pause an active match — either player can pause.
     /// Sets match state to Paused and records the pause start ledger.
+    ///
+    /// Fix #1516: A match may not re-enter Paused if the accumulated pause duration
+    /// has already reached MAX_PAUSE_DURATION_LEDGERS. This caps how long a losing
+    /// player can keep the match in Paused to block oracle settlement.
     pub fn pause_match(env: Env, match_id: u64, caller: Address) -> Result<(), Error> {
         extend_instance_ttl(&env);
         caller.require_auth();
@@ -2568,6 +2597,11 @@ impl EscrowContract {
 
         if !is_p1 && !is_p2 {
             return Err(Error::Unauthorized);
+        }
+
+        // #1516: Reject pause if the total pause budget has already been consumed.
+        if m.total_pause_duration >= MAX_PAUSE_DURATION_LEDGERS {
+            return Err(Error::InvalidPauseState);
         }
 
         m.state = MatchState::Paused;
@@ -2770,6 +2804,15 @@ impl EscrowContract {
     ///   `ROLLBACK_WINDOW_SECONDS` (24 h) of `Match.last_heartbeat`. Outside
     ///   the window, the match is considered legitimately stalled and the
     ///   rollback is rejected with `Error::VotingPeriodElapsed`.
+    /// - **#1517 fix — mutual consent**: The first call from one player records
+    ///   their rollback vote. The refund only executes when the *other* player
+    ///   also calls this function (both votes present). A single player calling
+    ///   alone only sets their own flag and emits `("match", "rollback_vote")`.
+    ///   This prevents a losing player from front-running the oracle with a
+    ///   unilateral rollback to recover their stake.
+    /// - **#1517 fix — reject after game finished**: The match must still be
+    ///   `Active`; a `PendingResult` state means the oracle has already
+    ///   submitted a result and the rollback is rejected with `InvalidState`.
     /// - The full stake is refunded to whichever players had deposited — no
     ///   cancellation fee is applied. This is a player-friendly escape hatch,
     ///   not a fee-bearing cancel.
@@ -2813,6 +2856,8 @@ impl EscrowContract {
         // Only Active matches may be rolled back. Pending matches should use
         // `cancel_match`; PendingResult/Completed have the oracle dispute path;
         // Paused matches can be either resumed or expired depending on intent.
+        // #1517: PendingResult means the oracle has already determined a result —
+        // rollback is explicitly rejected here.
         if m.state != MatchState::Active {
             return Err(Error::InvalidState);
         }
@@ -2826,6 +2871,36 @@ impl EscrowContract {
         if since_heartbeat > ROLLBACK_WINDOW_SECONDS {
             return Err(Error::VotingPeriodElapsed);
         }
+
+        // #1517 fix — mutual consent: record this player's vote. If only one
+        // player has voted so far, persist the flag and return Ok(()) without
+        // executing a refund. The refund only runs once both players agree.
+        if is_p1 {
+            m.rollback_vote_player1 = true;
+        } else {
+            m.rollback_vote_player2 = true;
+        }
+
+        // Persist vote state even if we're not yet executing the rollback.
+        env.storage()
+            .persistent()
+            .set(&DataKey::Match(match_id), &m);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Match(match_id),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
+        );
+
+        // If both players haven't yet voted, emit a partial-vote event and return.
+        if !m.rollback_vote_player1 || !m.rollback_vote_player2 {
+            env.events().publish(
+                (Symbol::new(&env, "match"), symbol_short!("rb_vote")),
+                (match_id, disputer),
+            );
+            return Ok(());
+        }
+
+        // Both players have consented — proceed with refund.
 
         // Drop the active-match index for both players before mutating state
         // so future-player/match lookups stay consistent.
@@ -3034,10 +3109,12 @@ impl EscrowContract {
             .get(&DataKey::Match(match_id))
             .ok_or(Error::MatchNotFound)?;
 
-        // Only Active matches may be admin-resolved. Pending matches should
-        // use `expire_match`; Completed/Cancelled are terminal; PendingResult
-        // has the normal dispute path; Paused can be resumed or expired.
-        if m.state != MatchState::Active {
+        // Only Active or Paused matches may be admin-resolved. Pending matches
+        // should use `expire_match`; Completed/Cancelled are terminal;
+        // PendingResult has the normal dispute path.
+        // #1516 fix: also accept Paused so admin can recover funds from a match
+        // that a losing player has kept paused indefinitely.
+        if m.state != MatchState::Active && m.state != MatchState::Paused {
             return Err(Error::InvalidState);
         }
 
@@ -3048,11 +3125,14 @@ impl EscrowContract {
             return Err(Error::NotFunded);
         }
 
-        // Enforce the 7-day stall threshold. Reject admin intervention if
-        // the match has shown recent activity (heartbeat) within that window.
+        // #1518 fix: measure the stall window from match activation time
+        // (`activated_at`), not from the player-controlled `last_heartbeat`.
+        // This prevents a losing player from heartbeat-griefing to keep the
+        // stall window from ever opening.
         let now: u64 = env.ledger().timestamp();
-        let since_heartbeat: u64 = now.saturating_sub(m.last_heartbeat);
-        if since_heartbeat <= ADMIN_STALL_WINDOW_SECONDS {
+        let reference_ts: u64 = m.activated_at.unwrap_or(m.last_heartbeat);
+        let since_activation: u64 = now.saturating_sub(reference_ts);
+        if since_activation <= ADMIN_STALL_WINDOW_SECONDS {
             return Err(Error::MatchNotExpired);
         }
 
@@ -3642,7 +3722,19 @@ impl EscrowContract {
     }
 
     /// Internal helper to update player statistics on match completion.
-    fn update_player_stats(env: &Env, player: &Address, winner: &Winner, stake_amount: i128) {
+    /// Update per-player win/loss/draw counters after a match is settled.
+    ///
+    /// #1519 fix: `is_player1` indicates which side this player was on so that
+    /// `Winner::Player1` increments *wins* for player1 and *losses* for player2
+    /// (and vice-versa), rather than unconditionally mapping Player1→wins and
+    /// Player2→losses regardless of which player is being updated.
+    fn update_player_stats(
+        env: &Env,
+        player: &Address,
+        winner: &Winner,
+        stake_amount: i128,
+        is_player1: bool,
+    ) {
         let mut stats: PlayerStats = env
             .storage()
             .persistent()
@@ -3659,8 +3751,20 @@ impl EscrowContract {
         stats.total_volume_staked = stats.total_volume_staked.saturating_add(stake_amount);
 
         match winner {
-            Winner::Player1 => stats.wins = stats.wins.saturating_add(1),
-            Winner::Player2 => stats.losses = stats.losses.saturating_add(1),
+            Winner::Player1 => {
+                if is_player1 {
+                    stats.wins = stats.wins.saturating_add(1);
+                } else {
+                    stats.losses = stats.losses.saturating_add(1);
+                }
+            }
+            Winner::Player2 => {
+                if is_player1 {
+                    stats.losses = stats.losses.saturating_add(1);
+                } else {
+                    stats.wins = stats.wins.saturating_add(1);
+                }
+            }
             Winner::Draw => stats.draws = stats.draws.saturating_add(1),
             Winner::None => {}
         }
@@ -6406,6 +6510,85 @@ impl EscrowContract {
 
         Ok(())
     }
+
+    // ── FIDE / Platform ELO Rating Registry (issue #1434) ────────────────────
+
+    /// Register or update the oracle-verified ELO rating for a player on a
+    /// given chess platform.
+    ///
+    /// Requires oracle authorization — ratings cannot be self-reported, which
+    /// is the property that makes them safe to use for ELO-based matchmaking
+    /// (v4.0 roadmap).
+    ///
+    /// # Arguments
+    ///
+    /// * `player`   — Stellar address of the player whose rating is being recorded.
+    /// * `platform` — [`Platform::Lichess`] or [`Platform::ChessDotCom`].
+    /// * `username` — Platform username (e.g. `"Magnus"` on Lichess).
+    /// * `rating`   — Verified ELO / platform rating as a `u32`.
+    ///
+    /// # Events
+    ///
+    /// Emits `("rating", "registered")` with payload `(player, platform, rating)`.
+    pub fn register_player_rating(
+        env: Env,
+        caller: Address,
+        player: Address,
+        platform: Platform,
+        username: soroban_sdk::String,
+        rating: u32,
+    ) -> Result<(), Error> {
+        extend_instance_ttl(&env);
+
+        // Only the configured oracle may submit ratings.
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Oracle)
+            .ok_or(Error::Unauthorized)?;
+        caller.require_auth();
+        if caller != oracle {
+            return Err(Error::Unauthorized);
+        }
+
+        let record = PlayerRating {
+            username,
+            rating,
+            recorded_ledger: env.ledger().sequence(),
+        };
+
+        let key = PlayerRatingKey::Rating(player.clone(), platform.clone());
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+
+        env.events().publish(
+            (Symbol::new(&env, "rating"), symbol_short!("registered")),
+            (player, platform, rating),
+        );
+
+        Ok(())
+    }
+
+    /// Return the oracle-verified rating for `player` on `platform`, or
+    /// `None` if no rating has been registered yet.
+    ///
+    /// This is a view function — no authentication required.
+    pub fn get_player_rating(
+        env: Env,
+        player: Address,
+        platform: Platform,
+    ) -> Option<PlayerRating> {
+        let key = PlayerRatingKey::Rating(player, platform);
+        let record: Option<PlayerRating> = env.storage().persistent().get(&key);
+        if record.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        }
+        record
+    }
 }
 
 impl EscrowContract {
@@ -6502,88 +6685,5 @@ impl EscrowContract {
             fee
         };
         Ok(fee)
-    }
-
-    // ── FIDE / Platform ELO Rating Registry (issue #1434) ────────────────────
-
-    /// Register or update the oracle-verified ELO rating for a player on a
-    /// given chess platform.
-    ///
-    /// Requires oracle authorization — ratings cannot be self-reported, which
-    /// is the property that makes them safe to use for ELO-based matchmaking
-    /// (v4.0 roadmap).
-    ///
-    /// # Arguments
-    ///
-    /// * `player`   — Stellar address of the player whose rating is being recorded.
-    /// * `platform` — [`Platform::Lichess`] or [`Platform::ChessDotCom`].
-    /// * `username` — Platform username (e.g. `"Magnus"` on Lichess).
-    /// * `rating`   — Verified ELO / platform rating as a `u32`.
-    ///
-    /// # Events
-    ///
-    /// Emits `("rating", "registered")` with payload `(player, platform, rating)`.
-    pub fn register_player_rating(
-        env: Env,
-        caller: Address,
-        player: Address,
-        platform: Platform,
-        username: soroban_sdk::String,
-        rating: u32,
-    ) -> Result<(), Error> {
-        extend_instance_ttl(&env);
-
-        // Only the configured oracle may submit ratings.
-        let oracle: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Oracle)
-            .ok_or(Error::Unauthorized)?;
-        caller.require_auth();
-        if caller != oracle {
-            return Err(Error::Unauthorized);
-        }
-
-        let record = PlayerRating {
-            username,
-            rating,
-            recorded_ledger: env.ledger().sequence(),
-        };
-
-        let key = PlayerRatingKey::Rating(player.clone(), platform.clone());
-        env.storage().persistent().set(&key, &record);
-        env.storage().persistent().extend_ttl(
-            &key,
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
-
-        env.events().publish(
-            (Symbol::new(&env, "rating"), symbol_short!("registered")),
-            (player, platform, rating),
-        );
-
-        Ok(())
-    }
-
-    /// Return the oracle-verified rating for `player` on `platform`, or
-    /// `None` if no rating has been registered yet.
-    ///
-    /// This is a view function — no authentication required.
-    pub fn get_player_rating(
-        env: Env,
-        player: Address,
-        platform: Platform,
-    ) -> Option<PlayerRating> {
-        let key = PlayerRatingKey::Rating(player, platform);
-        let record: Option<PlayerRating> = env.storage().persistent().get(&key);
-        if record.is_some() {
-            env.storage().persistent().extend_ttl(
-                &key,
-                MATCH_TTL_LEDGERS,
-                MATCH_TTL_LEDGERS,
-            );
-        }
-        record
     }
 }

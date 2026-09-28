@@ -20,6 +20,10 @@ fn tiers_vec(env: &Env, items: &[(i128, u32)]) -> soroban_sdk::Vec<FeeTier> {
     v
 }
 
+/// Realistic 7-decimal token amounts expressed in base units (stroops).
+/// 1 XLM = 10_000_000 stroops.
+const ONE_XLM: i128 = 10_000_000;
+
 // ── get_fee_tiers default ─────────────────────────────────────────────────────
 
 #[test]
@@ -234,40 +238,69 @@ fn test_fee_three_tier_schedule() {
     // stake=101 → pot=202  → fee=2 (1%)
     assert_eq!(client.calculate_fee_by_tier(&101), 2);
 
-    // stake=1000 → pot=2000 → fee=20 (1%)
+    // stake=1000 → pot=2000 → fee=20 (1%, inclusive mid tier)
     assert_eq!(client.calculate_fee_by_tier(&1000), 20);
 
     // stake=1001 → pot=2002 → fee=40 (2%)
     assert_eq!(client.calculate_fee_by_tier(&1001), 40);
 }
 
+// ── Realistic 7-decimal (stroop) amounts ──────────────────────────────────────
+//
+// Regression coverage for #1538: tier bounds are raw base units, so they must
+// be configured with realistic 7-decimal amounts (1 XLM = 10_000_000 stroops)
+// rather than tiny integers that would cap new players at 0.00001 XLM.
+
 #[test]
-fn test_fee_single_tier_applies_universally() {
+fn test_fee_tiers_with_realistic_seven_decimal_amounts() {
     let (env, contract_id, _oracle, _p1, _p2, _token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
 
-    // Flat 1% for everything.
-    let t = tiers_vec(&env, &[(i128::MAX, 100)]);
+    // Bronze: ≤ 10 XLM  → 50 bps
+    // Silver: ≤ 100 XLM → 100 bps
+    // Gold:   ≤ MAX     → 200 bps
+    let t = tiers_vec(
+        &env,
+        &[(10 * ONE_XLM, 50), (100 * ONE_XLM, 100), (i128::MAX, 200)],
+    );
     client.set_fee_tiers(&t);
 
-    // stake=100 → pot=200 → fee=2
-    assert_eq!(client.calculate_fee_by_tier(&100), 2);
-    // stake=10_000 → pot=20_000 → fee=200
-    assert_eq!(client.calculate_fee_by_tier(&10_000), 200);
+    let stored = client.get_fee_tiers();
+    assert_eq!(stored.get(0).unwrap().max_stake, 10 * ONE_XLM);
+    assert_eq!(stored.get(1).unwrap().max_stake, 100 * ONE_XLM);
+
+    // A new player staking 1 XLM (10_000_000 stroops) lands in Bronze and is
+    // not capped out of real-value matches.
+    // stake=1 XLM → pot=2 XLM → fee = 20_000_000 * 50 / 10_000 = 100_000 stroops
+    assert_eq!(client.calculate_fee_by_tier(&ONE_XLM), 100_000);
+
+    // 10 XLM is inclusive in Bronze → pot=20 XLM → fee = 200_000_000 * 50 / 10_000
+    assert_eq!(client.calculate_fee_by_tier(&(10 * ONE_XLM)), 1_000_000);
+
+    // 10 XLM + 1 stroop falls into Silver → pot ≈ 20 XLM → fee = 200_000_002 * 100 / 10_000
+    assert_eq!(client.calculate_fee_by_tier(&(10 * ONE_XLM + 1)), 2_000_000);
+
+    // 100 XLM is inclusive in Silver → pot=200 XLM → fee = 2_000_000_000 * 100 / 10_000
+    assert_eq!(client.calculate_fee_by_tier(&(100 * ONE_XLM)), 20_000_000);
+
+    // Above Silver falls into Gold → pot=200 XLM + 2 stroops → fee = 2_000_000_002 * 200 / 10_000
+    assert_eq!(client.calculate_fee_by_tier(&(100 * ONE_XLM + 1)), 40_000_000);
 }
 
 #[test]
-fn test_fee_update_takes_effect_immediately() {
+fn test_fee_tiers_accept_realistic_seven_decimal_bounds() {
     let (env, contract_id, _oracle, _p1, _p2, _token, _admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
 
-    // Initially 1% flat.
-    let t1 = tiers_vec(&env, &[(i128::MAX, 100)]);
-    client.set_fee_tiers(&t1);
-    assert_eq!(client.calculate_fee_by_tier(&1000), 20);
+    // Admin-configurable per token: bounds expressed in the token's base units.
+    let t = tiers_vec(
+        &env,
+        &[(ONE_XLM, 50), (10 * ONE_XLM, 100), (i128::MAX, 200)],
+    );
+    assert!(client.try_set_fee_tiers(&t).is_ok());
 
-    // Update to 2% flat.
-    let t2 = tiers_vec(&env, &[(i128::MAX, 200)]);
-    client.set_fee_tiers(&t2);
-    assert_eq!(client.calculate_fee_by_tier(&1000), 40);
+    let stored = client.get_fee_tiers();
+    assert_eq!(stored.len(), 3);
+    assert_eq!(stored.get(0).unwrap().max_stake, ONE_XLM);
+    assert_eq!(stored.get(1).unwrap().max_stake, 10 * ONE_XLM);
 }

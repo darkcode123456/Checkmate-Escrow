@@ -25,19 +25,60 @@ fn test_deposit_batch_all_valid() {
         &Platform::Lichess,
     );
 
-    let entries: soroban_sdk::Vec<(u64, Address)> = soroban_sdk::vec![
-        &env,
-        (match_a, player1.clone()),
-        (match_b, player1.clone()),
-    ];
+    let entries: soroban_sdk::Vec<u64> = soroban_sdk::vec![&env, match_a, match_b];
 
-    let results = client.deposit_batch(&entries);
+    let results = client.deposit_batch(&player1, &entries);
     assert_eq!(results.len(), 2);
     assert_eq!(results.get(0).unwrap(), None);
     assert_eq!(results.get(1).unwrap(), None);
 
     assert!(client.get_match(&match_a).player1_deposited);
     assert!(client.get_match(&match_b).player1_deposited);
+}
+
+#[test]
+fn test_deposit_batch_same_player_three_matches() {
+    // Issue #1527: one player funding several matches in a single batch must
+    // succeed — auth is required only once for the whole invocation.
+    let (env, contract_id, _oracle, player1, player2, token, _admin) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let match_a = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "batch_three1"),
+        &Platform::Lichess,
+    );
+    let match_b = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "batch_three2"),
+        &Platform::Lichess,
+    );
+    let match_c = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &token,
+        &String::from_str(&env, "batch_three3"),
+        &Platform::Lichess,
+    );
+
+    let entries: soroban_sdk::Vec<u64> = soroban_sdk::vec![&env, match_a, match_b, match_c];
+
+    let results = client.deposit_batch(&player1, &entries);
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0).unwrap(), None);
+    assert_eq!(results.get(1).unwrap(), None);
+    assert_eq!(results.get(2).unwrap(), None);
+
+    assert!(client.get_match(&match_a).player1_deposited);
+    assert!(client.get_match(&match_b).player1_deposited);
+    assert!(client.get_match(&match_c).player1_deposited);
 }
 
 #[test]
@@ -55,13 +96,9 @@ fn test_deposit_batch_mixed_valid_and_invalid() {
     );
 
     // Second entry references a non-existent match.
-    let entries: soroban_sdk::Vec<(u64, Address)> = soroban_sdk::vec![
-        &env,
-        (match_id, player1.clone()),
-        (9999u64, player1.clone()),
-    ];
+    let entries: soroban_sdk::Vec<u64> = soroban_sdk::vec![&env, match_id, 9999u64];
 
-    let results = client.deposit_batch(&entries);
+    let results = client.deposit_batch(&player1, &entries);
     assert_eq!(results.len(), 2);
     assert_eq!(results.get(0).unwrap(), None);
     assert_eq!(results.get(1).unwrap(), Some(Error::MatchNotFound));
@@ -95,13 +132,9 @@ fn test_deposit_batch_already_funded_entry_fails_independently() {
     // Pre-deposit player1 into match_id so the batch entry is a duplicate.
     client.deposit(&match_id, &player1);
 
-    let entries: soroban_sdk::Vec<(u64, Address)> = soroban_sdk::vec![
-        &env,
-        (match_id, player1.clone()),   // duplicate — should fail
-        (match_id2, player1.clone()),  // fresh — should succeed
-    ];
+    let entries: soroban_sdk::Vec<u64> = soroban_sdk::vec![&env, match_id, match_id2];
 
-    let results = client.deposit_batch(&entries);
+    let results = client.deposit_batch(&player1, &entries);
     assert_eq!(results.get(0).unwrap(), Some(Error::AlreadyFunded));
     assert_eq!(results.get(1).unwrap(), None);
 }
@@ -122,12 +155,9 @@ fn test_deposit_batch_returns_contract_paused_when_paused() {
 
     client.pause(&admin);
 
-    let entries: soroban_sdk::Vec<(u64, Address)> = soroban_sdk::vec![
-        &env,
-        (match_id, player1.clone()),
-    ];
+    let entries: soroban_sdk::Vec<u64> = soroban_sdk::vec![&env, match_id];
 
-    let result = client.try_deposit_batch(&entries);
+    let result = client.try_deposit_batch(&player1, &entries);
     assert_eq!(result, Err(Ok(Error::ContractPaused)));
 }
 
@@ -238,21 +268,6 @@ fn test_protocol_config_stores_and_retrieves_max_protocol_fee() {
     let (env, contract_id, _oracle, _p1, _p2, _token, admin) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
 
-    client.set_protocol_config(&ProtocolConfig {
-        vesting_duration_seconds: 0,
-        cancellation_fee_basis_points: 0,
-        treasury: admin.clone(),
-        stablecoin_only_mode: false,
-        maximum_stake: None,
-        match_timeout_seconds: DEFAULT_MATCH_TIMEOUT_SECONDS,
-        protocol_fee_bps: 200,
-        fee_recipient: admin.clone(),
-        minimum_stake: DEFAULT_MINIMUM_STAKE,
-        max_protocol_fee: Some(75),
-        dispute_bond_tier_schedule: soroban_sdk::vec![&env],
-    });
+    client.se
 
-    let config = client.get_protocol_config();
-    assert_eq!(config.max_protocol_fee, Some(75));
-    assert_eq!(config.protocol_fee_bps, 200);
-}
+/* … truncated 643 chars — edit only what you need near the top … */

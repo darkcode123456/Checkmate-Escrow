@@ -24,7 +24,7 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Str
 use types::{
     BatchResultEntry, CandidateTally, ConsensusState, DataKey, OracleMetrics, OracleRegistration,
     OracleSubmissionEntry, OracleVoteRecord, PendingSlash, Platform, RateLimitConfig,
-    RateLimitStatus, RateWindow, ResultEntry, Winner,
+    RateLimitStatus, RateWindow, RateEntry, ResultEntry, Winner,
 };
 
 /// Maximum response time SLA threshold, in milliseconds (5 seconds).
@@ -56,6 +56,11 @@ const RATE_LIMIT_ALERT_THRESHOLD_PCT: u64 = 80;
 /// TTL for rate-limit window storage: ~2 days at 5s/ledger, comfortably longer
 /// than the daily window so counters never expire mid-window.
 const RATE_LIMIT_TTL_LEDGERS: u32 = 34_560;
+
+/// Maximum age (in ledgers) a stored exchange rate may have before `swap`
+/// rejects it as stale. ~1 day at 5 s/ledger (17,280 ledgers ≈ 24 hours).
+/// Operators should call `set_rate` at least once per day to keep rates fresh.
+const MAX_RATE_AGE_LEDGERS: u32 = 17_280;
 
 /// Default m-of-n consensus threshold: a single matching submission finalizes
 /// a result. This is the degenerate n=1 configuration that reproduces the
@@ -230,6 +235,12 @@ impl OracleContract {
     /// `match_id` is the match whose result triggered the slash, and is
     /// used only as an identifier for the pending slash (an oracle can have
     /// at most one pending slash per match).
+    ///
+    /// # Errors
+    /// - [`Error::SlashAlreadyPending`] — a slash for this `(oracle_address, match_id)` pair
+    ///   is already staged and has not yet been finalized or cancelled. Call
+    ///   [`Self::admin_cancel_slash`] to cancel it, or [`Self::finalize_slash`] to execute it
+    ///   before staging a new slash.
     pub fn slash_oracle(
         env: Env,
         oracle_address: Address,
@@ -243,6 +254,17 @@ impl OracleContract {
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
+
+        // Reject if a pending slash already exists for this (oracle, match_id) pair.
+        // Silently overwriting would reset `eligible_ledger`, potentially shortening or
+        // extending the governance grace window unintentionally.
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::PendingSlash(oracle_address.clone(), match_id))
+        {
+            return Err(Error::SlashAlreadyPending);
+        }
 
         let registration: OracleRegistration = env
             .storage()
@@ -454,7 +476,7 @@ impl OracleContract {
             MATCH_TTL_LEDGERS,
         );
 
-        let expiry = env.ledger().timestamp() + DEFAULT_CACHE_TTL_SECS;
+        let expiry = env.ledger().timestamp().saturating_add(DEFAULT_CACHE_TTL_SECS);
         let cache_key = DataKey::OracleCache(game_id.clone(), platform.clone());
         env.storage()
             .persistent()
@@ -551,7 +573,7 @@ impl OracleContract {
 
         // All checks passed — commit atomically.
         let current_ledger = env.ledger().sequence();
-        let expiry = env.ledger().timestamp() + DEFAULT_CACHE_TTL_SECS;
+        let expiry = env.ledger().timestamp().saturating_add(DEFAULT_CACHE_TTL_SECS);
         for i in 0..len {
             let entry = entries.get(i).unwrap();
             env.storage().persistent().set(
@@ -810,6 +832,7 @@ impl OracleContract {
                     result: winning.result.clone(),
                     submitted_ledger: env.ledger().sequence(),
                     submitter: oracle.clone(),
+                    confidence: None,
                 },
             );
             env.storage().persistent().extend_ttl(
@@ -818,7 +841,7 @@ impl OracleContract {
                 MATCH_TTL_LEDGERS,
             );
 
-            let expiry = env.ledger().timestamp() + DEFAULT_CACHE_TTL_SECS;
+            let expiry = env.ledger().timestamp().saturating_add(DEFAULT_CACHE_TTL_SECS);
             let cache_key = DataKey::OracleCache(winning.game_id.clone(), winning.platform.clone());
             env.storage()
                 .persistent()
@@ -978,6 +1001,7 @@ impl OracleContract {
                 result: result.clone(),
                 submitted_ledger: env.ledger().sequence(),
                 submitter: admin,
+                confidence: None,
             },
         );
         env.storage().persistent().extend_ttl(
@@ -986,7 +1010,7 @@ impl OracleContract {
             MATCH_TTL_LEDGERS,
         );
 
-        let expiry = env.ledger().timestamp() + DEFAULT_CACHE_TTL_SECS;
+        let expiry = env.ledger().timestamp().saturating_add(DEFAULT_CACHE_TTL_SECS);
         let cache_key = DataKey::OracleCache(game_id, platform);
         env.storage()
             .persistent()
@@ -1509,6 +1533,11 @@ impl OracleContract {
     /// Rotate the admin to a new address. Requires current admin auth.
     /// Emits an `admin / admin_rot` event with `(old_admin, new_admin)`.
     ///
+    /// # Deprecated
+    /// This function transfers admin immediately with no acceptance from the new address.
+    /// Prefer [`Self::propose_admin`] + [`Self::accept_admin`] for a safer two-step transfer
+    /// that prevents accidental transfers to unreachable addresses.
+    ///
     /// # Errors
     /// - [`Error::Unauthorized`] — contract has not been initialized or caller is not the current admin.
     pub fn update_admin(env: Env, new_admin: Address) -> Result<(), Error> {
@@ -1527,10 +1556,89 @@ impl OracleContract {
         Ok(())
     }
 
+    /// Propose a new admin in a two-step transfer. Current admin only.
+    ///
+    /// Stores the nomination without transferring authority. The nominated
+    /// address must call [`Self::accept_admin`] to complete the transfer.
+    /// This prevents accidental transfers to an unreachable or wrong address.
+    ///
+    /// Emits an `admin / propose` event with the nominated `new_admin` address.
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] — contract has not been initialized or caller is not the current admin.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        extend_instance_ttl(&env);
+        let current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        current_admin.require_auth();
+
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdminProposal {
+                proposer: current_admin,
+                pending_admin: new_admin.clone(),
+            },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("propose")),
+            new_admin,
+        );
+        Ok(())
+    }
+
+    /// Accept a pending admin proposal. Pending admin only.
+    ///
+    /// Finalizes the two-step transfer initiated by [`Self::propose_admin`],
+    /// replacing the current admin with the caller. Clears the pending
+    /// proposal so a second call cannot replay the transfer.
+    ///
+    /// Emits an `admin / xfer` event with the new admin address.
+    ///
+    /// # Errors
+    /// - [`Error::NoPendingAdmin`] — no proposal exists (never proposed, already accepted, or
+    ///   already cancelled by a subsequent `propose_admin` call with a different nominee).
+    /// - [`Error::Unauthorized`] — caller is not the nominated pending admin, or the proposer
+    ///   is no longer the current admin.
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        extend_instance_ttl(&env);
+        let proposal: PendingAdminProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdmin)?;
+        proposal.pending_admin.require_auth();
+
+        // Guard against a scenario where the admin rotated (via `update_admin`) between
+        // `propose_admin` and `accept_admin`, which would make the proposer stale.
+        let current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if current_admin != proposal.proposer {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &proposal.pending_admin);
+        // Remove the proposal so a second `accept_admin` call cannot replay the transfer.
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("xfer")),
+            proposal.pending_admin,
+        );
+        Ok(())
+    }
+
     /// Pause the oracle — admin only. Blocks submit_result while paused.
     ///
     /// # Errors
     /// - [`Error::Unauthorized`] — contract has not been initialized or caller is not the admin.
+    /// - [`Error::InvalidPauseState`] — contract is already paused.
     pub fn pause(env: Env) -> Result<(), Error> {
         extend_instance_ttl(&env);
         let admin: Address = env
@@ -1539,6 +1647,14 @@ impl OracleContract {
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidPauseState);
+        }
         env.storage().instance().set(&DataKey::Paused, &true);
         env.events()
             .publish((Symbol::new(&env, "admin"), symbol_short!("paused")), ());
@@ -1555,6 +1671,7 @@ impl OracleContract {
     ///
     /// # Errors
     /// - [`Error::Unauthorized`] — contract has not been initialized or caller is not the admin.
+    /// - [`Error::InvalidPauseState`] — contract is not currently paused.
     pub fn unpause(env: Env) -> Result<(), Error> {
         extend_instance_ttl(&env);
         let admin: Address = env
@@ -1563,6 +1680,14 @@ impl OracleContract {
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         admin.require_auth();
+        if !env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidPauseState);
+        }
         env.storage().instance().set(&DataKey::Paused, &false);
         env.events()
             .publish((Symbol::new(&env, "admin"), symbol_short!("unpaused")), ());
@@ -1710,7 +1835,7 @@ impl OracleContract {
         let elapsed_in_current = now.saturating_sub(window.window_start).min(window_secs);
         let remaining = window_secs - elapsed_in_current;
         let weighted_previous = (window.previous_count as u64 * remaining) / window_secs;
-        window.current_count + weighted_previous as u32
+        window.current_count.saturating_add(weighted_previous as u32)
     }
 
     /// Check `oracle`'s hourly and daily sliding-window limits can absorb
@@ -1739,8 +1864,8 @@ impl OracleContract {
             return Err(Error::RateLimitExceeded);
         }
 
-        hourly_window.current_count += count;
-        daily_window.current_count += count;
+        hourly_window.current_count = hourly_window.current_count.saturating_add(count);
+        daily_window.current_count = daily_window.current_count.saturating_add(count);
 
         env.storage().persistent().set(&hourly_key, &hourly_window);
         env.storage().persistent().extend_ttl(
@@ -1798,38 +1923,71 @@ impl OracleContract {
         admin.require_auth();
 
         if rate <= 0 {
-            return Err(Error::InvalidRateLimit);
+            return Err(Error::InvalidRate);
         }
 
+        let entry = RateEntry {
+            rate,
+            updated_ledger: env.ledger().sequence(),
+        };
         env.storage()
             .persistent()
-            .set(&DataKey::Rate(token_a.clone(), token_b.clone()), &rate);
+            .set(&DataKey::Rate(token_a.clone(), token_b.clone()), &entry);
         env.storage().persistent().extend_ttl(
-            &DataKey::Rate(token_a, token_b),
+            &DataKey::Rate(token_a.clone(), token_b.clone()),
             MATCH_TTL_LEDGERS,
             MATCH_TTL_LEDGERS,
         );
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("rate_set")),
+            (token_a, token_b, rate),
+        );
+
         Ok(())
     }
 
     pub fn get_rate(env: Env, token_a: Address, token_b: Address) -> Result<i128, Error> {
         extend_instance_ttl(&env);
+        let entry: RateEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Rate(token_a, token_b))
+            .ok_or(Error::RateNotFound)?;
+        Ok(entry.rate)
+    }
+
+    /// Return the stored rate and the ledger at which it was last set for a
+    /// (token_a, token_b) pair. Callers can compute `ledger.sequence() -
+    /// updated_ledger` to determine the rate's age in ledgers and decide
+    /// whether it is fresh enough to use.
+    ///
+    /// # Errors
+    /// - [`Error::RateNotFound`] — no rate has been set for this pair.
+    pub fn get_rate_with_age(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+    ) -> Result<RateEntry, Error> {
+        extend_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::Rate(token_a, token_b))
-            .ok_or(Error::ResultNotFound)
+            .ok_or(Error::RateNotFound)
     }
 
     /// Atomically swap `token_in` for `token_out` using an on-chain exchange rate.
     ///
     /// # Flow (atomic, single transaction):
     /// 1. Caller authorizes the swap and provides `amount_in` via `caller.require_auth()`.
-    /// 2. Compute `amount_out` using the stored rate between `token_in` and `token_out`.
-    /// 3. Verify `amount_out ≥ min_amount_out` (slippage bound).
-    /// 4. Transfer `amount_in` of `token_in` **from the caller** into the contract.
-    /// 5. Transfer `amount_out` of `token_out` **from the contract** to the recipient.
+    /// 2. Look up the stored `RateEntry` for `(token_in, token_out)` or its reverse.
+    /// 3. Reject the rate if it is older than `MAX_RATE_AGE_LEDGERS` ledgers.
+    /// 4. Compute `amount_out` using the rate.
+    /// 5. Verify `amount_out ≥ min_amount_out` (slippage bound).
+    /// 6. Transfer `amount_in` of `token_in` **from the caller** into the contract.
+    /// 7. Transfer `amount_out` of `token_out` **from the contract** to the recipient.
     ///
-    /// If step 3 or 4 fails, the transaction aborts with no state changes (checks-effects-interactions).
+    /// If any step fails, the transaction aborts with no state changes (checks-effects-interactions).
     ///
     /// # Parameters
     /// - `caller: Address` — the account authorizing and providing `token_in`.
@@ -1842,7 +2000,7 @@ impl OracleContract {
     ///
     /// # Errors
     /// - [`Error::InvalidAmount`] — `amount_in` ≤ 0.
-    /// - [`Error::ResultNotFound`] — no rate exists for the `(token_in, token_out)` pair.
+    /// - [`Error::RateNotFound`] — no rate exists for the `(token_in, token_out)` pair.
     /// - [`Error::Overflow`] — numeric overflow during rate multiplication/division.
     /// - [`Error::SlippageExceeded`] — computed `amount_out` < `min_amount_out`.
     pub fn swap(
@@ -1863,21 +2021,28 @@ impl OracleContract {
             return Err(Error::InvalidAmount);
         }
 
-        // `DataKey::Rate(X, Y)` stores "units of Y per unit of X, scaled by
-        // 1e7" — the same convention `set_rate`/`get_rate` use, and the one
-        // escrow relies on when it validates a match's conversion_rate
-        // against `get_rate(token_a, token_b)`. So the *forward* rate for
-        // this swap, if set, lives under `Rate(token_in, token_out)` and
-        // converts by multiplying; only the reverse-keyed `Rate(token_out,
-        // token_in)` — units of token_in per token_out — needs dividing.
-        let amount_out = if let Some(rate) = env
+        let current_ledger = env.ledger().sequence();
+
+        // `DataKey::Rate(X, Y)` stores a RateEntry with "units of Y per unit
+        // of X, scaled by 1e7" — the same convention `set_rate`/`get_rate`
+        // use. The *forward* rate lives under `Rate(token_in, token_out)` and
+        // converts by multiplying; the reverse-keyed `Rate(token_out,
+        // token_in)` needs dividing.
+        //
+        // In either case the rate is rejected if it is older than
+        // MAX_RATE_AGE_LEDGERS, preventing stale prices from being used.
+        let amount_out = if let Some(entry) = env
             .storage()
             .persistent()
-            .get::<_, i128>(&DataKey::Rate(token_in.clone(), token_out.clone()))
+            .get::<_, RateEntry>(&DataKey::Rate(token_in.clone(), token_out.clone()))
         {
+            // Reject stale rates.
+            if current_ledger.saturating_sub(entry.updated_ledger) > MAX_RATE_AGE_LEDGERS {
+                return Err(Error::RateNotFound);
+            }
             // Rate is token_out per token_in; compute amount_in * rate / 1e7
             let amt = amount_in
-                .checked_mul(rate)
+                .checked_mul(entry.rate)
                 .ok_or(Error::Overflow)?
                 .checked_div(10_000_000)
                 .ok_or(Error::Overflow)?;
@@ -1885,23 +2050,27 @@ impl OracleContract {
                 return Err(Error::SlippageExceeded);
             }
             amt
-        } else if let Some(rate) = env
+        } else if let Some(entry) = env
             .storage()
             .persistent()
-            .get::<_, i128>(&DataKey::Rate(token_out.clone(), token_in.clone()))
+            .get::<_, RateEntry>(&DataKey::Rate(token_out.clone(), token_in.clone()))
         {
+            // Reject stale rates.
+            if current_ledger.saturating_sub(entry.updated_ledger) > MAX_RATE_AGE_LEDGERS {
+                return Err(Error::RateNotFound);
+            }
             // Rate is token_in per token_out (reverse-keyed); compute amount_in * 1e7 / rate
             let amt = amount_in
                 .checked_mul(10_000_000)
                 .ok_or(Error::Overflow)?
-                .checked_div(rate)
+                .checked_div(entry.rate)
                 .ok_or(Error::Overflow)?;
             if amt < min_amount_out {
                 return Err(Error::SlippageExceeded);
             }
             amt
         } else {
-            return Err(Error::ResultNotFound);
+            return Err(Error::RateNotFound);
         };
 
         // Checks passed. Now effects (atomic): collect token_in, then transfer token_out.

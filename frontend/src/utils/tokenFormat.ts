@@ -4,7 +4,7 @@ import {
   Contract,
   Keypair,
   Networks,
-  SorobanRpc,
+  rpc,
   TransactionBuilder,
   scValToNative,
   xdr,
@@ -50,7 +50,7 @@ export async function fetchTokenDecimals(
   const cached = decimalsCache.get(tokenContractId);
   if (cached !== undefined) return cached;
 
-  const server = new SorobanRpc.Server(rpcUrl);
+  const server = new rpc.Server(rpcUrl);
   const contract = new Contract(tokenContractId);
   // Simulation-only source account: sequence number is irrelevant since the
   // transaction is never submitted, only simulated to read `decimals()`.
@@ -65,7 +65,7 @@ export async function fetchTokenDecimals(
     .build();
 
   const sim = await server.simulateTransaction(tx);
-  if (!SorobanRpc.Api.isSimulationSuccess(sim) || !sim.result) {
+  if (!rpc.Api.isSimulationSuccess(sim) || !sim.result) {
     throw new Error(`Failed to fetch decimals for token ${tokenContractId}`);
   }
 

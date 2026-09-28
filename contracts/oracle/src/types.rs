@@ -97,6 +97,18 @@ pub struct ConsensusState {
     pub disputed: bool,
 }
 
+/// A stored exchange rate entry, pairing the rate value with the ledger
+/// sequence at which it was last set. Allows callers to detect stale rates
+/// before executing a swap.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RateEntry {
+    /// Exchange rate: units of token_b per unit of token_a, scaled by 1e7.
+    pub rate: i128,
+    /// Ledger sequence number at which `set_rate` stored this rate.
+    pub updated_ledger: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -110,6 +122,7 @@ pub enum DataKey {
     OracleHourlyWindow(Address),
     /// Sliding window submission counters for the daily limit, keyed by oracle address.
     OracleDailyWindow(Address),
+    /// Exchange rate entry for a (token_a, token_b) pair, storing (rate, updated_ledger).
     Rate(Address, Address),
     /// Number of matching independent-oracle submissions required to finalize
     /// a match result via `submit_oracle_result`. Defaults to 1.
@@ -136,6 +149,9 @@ pub enum DataKey {
     /// A staged slash awaiting the grace period before it can be finalized,
     /// keyed by (oracle_address, match_id).
     PendingSlash(Address, u64),
+    /// A pending two-step admin transfer proposal, set by `propose_admin`
+    /// and consumed (or left to expire) by `accept_admin`.
+    PendingAdmin,
 }
 
 /// A slash that has been staged but not yet finalized, pending
@@ -153,6 +169,17 @@ pub struct PendingSlash {
     /// Ledger sequence number at which the slash becomes eligible for
     /// finalization (`staged_ledger + slashing_grace_period_ledgers`).
     pub eligible_ledger: u32,
+}
+
+/// A two-step admin transfer proposal, stored while waiting for the
+/// nominated address to accept via `accept_admin`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminProposal {
+    /// Address that created the proposal (the current admin at proposal time).
+    pub proposer: Address,
+    /// Nominated new admin that must call `accept_admin` to complete the transfer.
+    pub pending_admin: Address,
 }
 
 /// A single entry in an oracle's per-address submission history.
